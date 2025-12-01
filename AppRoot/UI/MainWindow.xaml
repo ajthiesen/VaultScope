@@ -1,0 +1,65 @@
+<!-- MainWindow.xaml - WPF layout in XAML -->
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+Title="BitLocker/TPM Readiness Auditor" Height="700" Width="1000">
+<Grid Margin="10">
+<Grid.RowDefinitions>
+<RowDefinition Height="Auto" />
+<RowDefinition Height="200" />
+<RowDefinition Height="Auto" />
+<RowDefinition Height="*" />
+<RowDefinition Height="Auto" />
+</Grid.RowDefinitions>
+
+
+<!-- Header -->
+<TextBlock Grid.Row="0" Text="BitLocker / TPM Readiness Auditor" FontSize="18" FontWeight="Bold" />
+
+
+<!-- Machine list input and PsExec browse -->
+<StackPanel Grid.Row="1" Orientation="Vertical" Margin="0,8,0,8">
+<TextBlock Text="Machine list (one per line):" />
+<TextBox Name="MachineListTextBox" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Height="120" />
+<StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+<Button Name="BrowsePsExecButton" Width="120">Browse PsExec</Button>
+<TextBlock Name="PsExecPathText" Margin="8,4,0,0">No PsExec selected</TextBlock>
+</StackPanel>
+</StackPanel>
+
+
+<!-- Action buttons -->
+<StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,8,0,8" Spacing="8">
+<Button Name="ScanButton" Width="100">Scan</Button>
+<Button Name="StopButton" Width="100" IsEnabled="False">Stop</Button>
+<Button Name="ExportCsvButton" Width="120" IsEnabled="False">Export CSV</Button>
+<Button Name="ExportJsonButton" Width="120" IsEnabled="False">Export JSON</Button>
+</StackPanel>
+
+
+<!-- Data grid for results -->
+<DataGrid Grid.Row="3" Name="ResultsDataGrid" AutoGenerateColumns="False" CanUserSortColumns="True">
+<DataGrid.Columns>
+<DataGridTextColumn Header="Machine" Binding="{Binding MachineName}" />
+<DataGridTextColumn Header="Online" Binding="{Binding Online}" />
+<DataGridTextColumn Header="Encrypted" Binding="{Binding Encrypted}" />
+<DataGridTextColumn Header="TPM" Binding="{Binding TpmSummary}" />
+<DataGridTextColumn Header="SecureBoot" Binding="{Binding SecureBoot}" />
+<DataGridTextColumn Header="Disk" Binding="{Binding DiskLayout}" />
+<DataGridTextColumn Header="OS" Binding="{Binding OsVersion}" />
+<DataGridTextColumn Header="Reason" Binding="{Binding ReasonCode}" />
+<DataGridTextColumn Header="ReasonText" Binding="{Binding ReasonText}" Width="300" />
+</DataGrid.Columns>
+</DataGrid>
+
+
+<!-- Status bar -->
+<StatusBar Grid.Row="4" Margin="0,8,0,0">
+<StatusBarItem>
+<TextBlock Name="StatusText">Ready</TextBlock>
+</StatusBarItem>
+<StatusBarItem HorizontalAlignment="Right">
+<TextBlock Name="ProgressSummary">0 / 0</TextBlock>
+</StatusBarItem>
+</StatusBar>
+</Grid>
+</Window>
