@@ -1,235 +1,180 @@
-<#
-.SYNOPSIS
-    VaultScope v1.0 - BitLocker / TPM / Encryption Status Auditor
+param(
+    [Parameter(Mandatory)]
+    [string]$TargetListPath,
 
-.DESCRIPTION
-    Uses PsExec to remotely determine BitLocker status.
-    Returns both:
-      - RAW Microsoft-native values
-      - HUMAN-readable interpretation
-
-    NO CHANGES ARE MADE.
-    Report-only by design.
-#>
+    [Parameter(Mandatory)]
+    [string]$PsExecPath
+)
 
 # -----------------------------
-# CONFIGURATION
+# Load targets
 # -----------------------------
-
-# Path to PsExec
-$PsExecPath = "C:\SAFE\PSTools\PsExec.exe"
-
-# Target list file (one host per line)
-$TargetListFile = "C:\SAFE\VaultScope\targets.txt"
-
-# Timeout for PsExec
-$Timeout = 60
-
-# -----------------------------
-# LOAD TARGETS
-# -----------------------------
-
-if (Test-Path $TargetListFile) {
-    $Targets = Get-Content $TargetListFile | Where-Object { $_ -and $_.Trim() -ne "" }
+if (!(Test-Path $TargetListPath)) {
+    Write-Error "Target list not found: $TargetListPath"
+    exit 1
 }
-else {
-    Write-Host "Target list not found: $TargetListFile" -ForegroundColor Red
-    exit
-}
+$Targets = Get-Content $TargetListPath | Where-Object { $_ -and $_.Trim() -ne "" }
 
 # -----------------------------
-# REMOTE PROBE
+# Remote script template
 # -----------------------------
-
 $RemoteScript = @'
 $result = [ordered]@{
-    Hostname              = $env:COMPUTERNAME
-    OSType                = $null
-
-    # Method info
-    MethodUsed            = $null
-
-    # RAW Microsoft values
-    ProtectionStatus      = $null
-    VolumeStatus          = $null
-    EncryptionPercent     = $null
-    NativeExitCode         = $null
-    NativeOutput           = $null
-
-    # Human friendly interpretations
-    FriendlyStatus         = $null
+    Hostname               = $env:COMPUTERNAME
+    OSType                 = $null
+    TPM_Present            = $false
     BitLockerSupported     = $false
-    TPM_Present             = $null
-
-    # Error
-    Error                  = $null
+    ProtectionStatus       = $null
+    VolumeStatus           = $null
+    EncryptionPercent      = $null
+    KeyProtectors          = $null
+    ReasonNotEncrypted     = $null
+    NativeExitCode         = $null
+    StdErr                 = $null
 }
 
 try {
     # -----------------------------
-    # OS DETECTION
+    # OS Type
     # -----------------------------
-    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-
-    switch ($os.ProductType) {
-        1 { $result.OSType = "Workstation" }
-        2 { $result.OSType = "DomainController" }
-        3 { $result.OSType = "Server" }
-        default { $result.OSType = "Unknown" }
-    }
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $result.OSType = switch ($os.ProductType) {1{"Workstation"} 2{"DomainController"} 3{"Server"} default{"Unknown"}}
 
     # -----------------------------
-    # TPM DETECTION
+    # TPM Detection
     # -----------------------------
     try {
         $tpm = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftTpm" -Class Win32_Tpm -ErrorAction Stop
         $result.TPM_Present = $true
-    }
-    catch {
-        $result.TPM_Present = $false
-    }
+    } catch {}
 
     # -----------------------------
-    # METHOD 1 — Get-BitLockerVolume
+    # BitLocker Detection
     # -----------------------------
     if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-
-        $result.MethodUsed = "Get-BitLockerVolume"
-
+        $result.BitLockerSupported = $true
         try {
-            $vol = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
+            $vol = Get-BitLockerVolume -MountPoint "C:"
+            $result.ProtectionStatus = [int]$vol.ProtectionStatus
+            $result.VolumeStatus = [int]$vol.VolumeStatus
+            $result.EncryptionPercent = [int]$vol.EncryptionPercentage
+            $result.KeyProtectors = ($vol.KeyProtector | Select-Object KeyProtectorType, KeyProtectorId)
 
-            $result.BitLockerSupported  = $true
-            $result.ProtectionStatus    = [int]$vol.ProtectionStatus
-            $result.VolumeStatus        = [int]$vol.VolumeStatus
-            $result.EncryptionPercent   = [int]$vol.EncryptionPercentage
-
-            # Friendly mapping
-            switch ($vol.ProtectionStatus) {
-                0 { $result.FriendlyStatus = "Not Encrypted" }
-                1 { $result.FriendlyStatus = "Encrypted" }
-                default { $result.FriendlyStatus = "Unknown" }
+            if ($vol.ProtectionStatus -eq 1) {
+                $result.ReasonNotEncrypted = "Volume protected"
+            } elseif ($vol.ProtectionStatus -eq 0) {
+                if ($result.TPM_Present -eq $false) {
+                    $result.ReasonNotEncrypted = "TPM not present"
+                } elseif (-not $vol.KeyProtector) {
+                    $result.ReasonNotEncrypted = "No key protector configured"
+                } else {
+                    $result.ReasonNotEncrypted = "Unknown reason"
+                }
+            } else {
+                $result.ReasonNotEncrypted = "Unknown protection status"
             }
+        } catch {
+            $result.StdErr = $_.Exception.Message
         }
-        catch {
-            $result.Error = $_.Exception.Message
-        }
-    }
-
-    # -----------------------------
-    # METHOD 2 — manage-bde fallback
-    # -----------------------------
-    else {
-        $result.MethodUsed = "manage-bde"
-
-        $bde = manage-bde -status C: 2>&1
-        $result.NativeExitCode  = $LASTEXITCODE
-        $result.NativeOutput     = ($bde -join "`n")
-
-        if ($result.NativeExitCode -eq 0) {
+    } else {
+        # -----------------------------
+        # Fallback: manage-bde
+        # -----------------------------
+        $output = manage-bde -status C: 2>&1
+        $result.NativeExitCode = $LASTEXITCODE
+        if ($LASTEXITCODE -eq 0) {
             $result.BitLockerSupported = $true
-
-            if ($result.NativeOutput -match "Percentage Encrypted:\s+(\d+)%") {
+            if ($output -match "Percentage Encrypted:\s+(\d+)%") {
                 $result.EncryptionPercent = [int]$matches[1]
             }
-
-            if ($result.NativeOutput -match "Protection Status:\s+Protection On") {
-                $result.FriendlyStatus = "Encrypted"
+            if ($output -match "Protection Status:\s+Protection On") {
+                $result.ProtectionStatus = 1
+                $result.ReasonNotEncrypted = "Volume protected"
+            } elseif ($output -match "Protection Status:\s+Protection Off") {
+                $result.ProtectionStatus = 0
+                if ($result.TPM_Present -eq $false) {
+                    $result.ReasonNotEncrypted = "TPM not present"
+                } else {
+                    $result.ReasonNotEncrypted = "No key protector configured"
+                }
+            } else {
+                $result.ReasonNotEncrypted = "Unknown protection status"
             }
-            elseif ($result.NativeOutput -match "Protection Status:\s+Protection Off") {
-                $result.FriendlyStatus = "Not Encrypted"
-            }
-            else {
-                $result.FriendlyStatus = "Unknown"
-            }
-        }
-        else {
+        } else {
             $result.BitLockerSupported = $false
-            $result.FriendlyStatus = "Not Supported / Not Installed"
+            $result.ReasonNotEncrypted = "BitLocker not installed or not supported"
         }
     }
-}
-catch {
-    $result.Error = $_.Exception.Message
+} catch {
+    $result.StdErr = $_.Exception.Message
 }
 
-$result | ConvertTo-Json -Compress -Depth 4
+$result | ConvertTo-Json -Compress -Depth 5
 '@
 
 # -----------------------------
-# MAIN LOOP
+# Scan loop
 # -----------------------------
-
 $Results = @()
-
 foreach ($Target in $Targets) {
-
-    Write-Host "`nScanning $Target..." -ForegroundColor Cyan
-
-    $cmd = @(
-        "\\$Target",
-        "-n", $Timeout,
-        "-h",
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy", "Bypass",
-        "-Command", "& { $RemoteScript }"
-    )
+    Write-Host "`nScanning: $Target"
+    $PsExecArgs = "\\$Target -h -n 60 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `"& { $RemoteScript }`""
 
     try {
-        $raw = & $PsExecPath @cmd 2>&1
-
-        # extract JSON only
+        $raw = & $PsExecPath $PsExecArgs 2>&1
         $json = ($raw | Where-Object { $_ -match "^\{.*\}$" })
-
         if ($json) {
             $obj = $json | ConvertFrom-Json
             $Results += $obj
-            Write-Host "✔ Success" -ForegroundColor Green
-        }
-        else {
+            Write-Host "✔ Success"
+        } else {
             $Results += [PSCustomObject]@{
-                Hostname          = $Target
-                OSType            = "Unknown"
-                BitLockerSupported= $false
-                FriendlyStatus    = "Failed"
-                NativeExitCode    = $null
-                Error             = "No JSON returned"
+                Hostname = $Target
+                ReasonNotEncrypted = "No JSON returned"
+                BitLockerSupported = $false
+                ProtectionStatus = $null
+                VolumeStatus = $null
+                EncryptionPercent = $null
+                KeyProtectors = $null
+                TPM_Present = $false
+                StdErr = ($raw -join "`n")
+                NativeExitCode = $null
             }
-            Write-Host "⚠ No JSON returned" -ForegroundColor Yellow
+            Write-Host "⚠ No JSON returned"
         }
-    }
-    catch {
+    } catch {
         $Results += [PSCustomObject]@{
-            Hostname           = $Target
-            OSType             = "Unknown"
+            Hostname = $Target
+            ReasonNotEncrypted = "Connection failed"
             BitLockerSupported = $false
-            FriendlyStatus     = "Connection Failed"
-            Error              = $_.Exception.Message
+            ProtectionStatus = $null
+            VolumeStatus = $null
+            EncryptionPercent = $null
+            KeyProtectors = $null
+            TPM_Present = $false
+            StdErr = $_.Exception.Message
+            NativeExitCode = -1
         }
-
-        Write-Host "✖ Connection failed" -ForegroundColor Red
+        Write-Host "✖ Connection failed"
     }
 }
 
 # -----------------------------
-# OUTPUT
+# Output
 # -----------------------------
-
-Write-Host "`n=========== VAULTSCOPE RESULTS ===========" -ForegroundColor Cyan
-
 $Results | Format-Table `
     Hostname,
     OSType,
     TPM_Present,
     BitLockerSupported,
-    FriendlyStatus,
-    EncryptionPercent,
     ProtectionStatus,
     VolumeStatus,
-    NativeExitCode -AutoSize
+    EncryptionPercent,
+    KeyProtectors,
+    ReasonNotEncrypted,
+    NativeExitCode,
+    StdErr -AutoSize
 
-# Optional export (recommended)
-# $Results | Export-Csv "C:\SAFE\VaultScope\VaultScope_Results.csv" -NoTypeInformation
-# $Results | ConvertTo-Json -Depth 4 | Out-File "C:\SAFE\VaultScope\VaultScope_Results.json"
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$Results | ConvertTo-Json -Depth 5 | Out-File "VaultScope_$Timestamp.json"
+Write-Host "`nScan complete. Results saved to VaultScope_$Timestamp.json"
